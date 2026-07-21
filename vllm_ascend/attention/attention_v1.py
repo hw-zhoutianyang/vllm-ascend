@@ -434,6 +434,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # attn_metadata during graph replay. Record the captured layer name only
         # for that path.
         self._layer_name: str | None = None
+        # flash-attention-npu (FA3) replacement for CANN V1 FIA in eager mode.
+        self._fa3_enabled = self._check_fa3_available()
+
+    @staticmethod
+    def _check_fa3_available():
+        """Return True if flash-attention-npu is installed and importable."""
+        try:
+            from vllm_ascend.attention.fa3_adapter import HAS_FLASH_ATTN_NPU
+            return HAS_FLASH_ATTN_NPU
+        except (ImportError, AttributeError):
+            return False
 
     def _graph_metadata_layer_name(self, layer: AttentionLayer | None = None) -> str | None:
         layer_name = layer.layer_name if layer is not None else self._layer_name
@@ -1297,62 +1308,91 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 learnable_sink=self.sinks,
             )
         else:
-            if not attn_metadata.causal:
-                attn_output, _ = torch_npu.npu_fused_infer_attention_score(
-                    query=query,
-                    key=key,
-                    value=value,
-                    block_table=block_table,
-                    input_layout="TND",
-                    block_size=block_size,
-                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
-                    num_key_value_heads=self.num_kv_heads,
-                    num_heads=self.num_heads,
-                    scale=self.scale,
-                    sparse_mode=0,
-                )
-            elif self.sliding_window is not None:
-                attn_output, _ = torch_npu.npu_fused_infer_attention_score(
-                    query=query,
-                    key=key,
-                    value=value,
-                    atten_mask=attn_metadata.attn_mask,
-                    block_table=block_table,
-                    input_layout="TND",
-                    block_size=block_size,
-                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
-                    num_key_value_heads=self.num_kv_heads,
-                    num_heads=self.num_heads,
-                    scale=self.scale,
-                    pre_tokens=self.sliding_window,
-                    next_tokens=0,
-                    sparse_mode=4,
-                )
-            else:
-                attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
-                    query=query,
-                    key=key,
-                    value=value,
-                    atten_mask=attn_metadata.attn_mask,
-                    block_table=block_table,
-                    input_layout="TND",
-                    block_size=block_size,
-                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
-                    num_key_value_heads=self.num_kv_heads,
-                    num_heads=self.num_heads,
-                    head_size=self.head_size,
-                    scale=self.scale,
-                    key_cache=self.key_cache,
-                    value_cache=self.value_cache,
-                    current_key=key,
-                    current_value=passed_value,
-                    attn_metadata=attn_metadata,
-                    is_prefill_no_cache=attn_metadata.attn_state == AscendAttentionState.PrefillNoCache,
-                    sparse_mode=3,
-                )
+            if self._fa3_enabled:
+                from vllm_ascend.attention.fa3_adapter import fa3_forward
+
+                is_cache = attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
+                try:
+                    attn_output = fa3_forward(
+                        query, key, value,
+                        attn_metadata=attn_metadata,
+                        scale=self.scale,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        head_size=self.head_size,
+                        sliding_window=self.sliding_window,
+                        causal=attn_metadata.causal,
+                        cache_mode=is_cache,
+                        block_table=block_table if is_cache else None,
+                        seq_lens_list=actual_seq_lengths_kv if is_cache else None,
+                    )
+                except (ImportError, ValueError, RuntimeError, TypeError):
+                    # FA3 unavailable for this invocation (e.g. head_dim too
+                    # large, or FA3 package not importable) → fall back to
+                    # the CANN path below.
+                    self._fa3_enabled = False
+                else:
+                    attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+                    output[:num_tokens] = attn_output[:num_tokens]
+                    return output
+
+            if not self._fa3_enabled:
+                if not attn_metadata.causal:
+                    attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                        query=query,
+                        key=key,
+                        value=value,
+                        block_table=block_table,
+                        input_layout="TND",
+                        block_size=block_size,
+                        actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        num_key_value_heads=self.num_kv_heads,
+                        num_heads=self.num_heads,
+                        scale=self.scale,
+                        sparse_mode=0,
+                    )
+                elif self.sliding_window is not None:
+                    attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                        query=query,
+                        key=key,
+                        value=value,
+                        atten_mask=attn_metadata.attn_mask,
+                        block_table=block_table,
+                        input_layout="TND",
+                        block_size=block_size,
+                        actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        num_key_value_heads=self.num_kv_heads,
+                        num_heads=self.num_heads,
+                        scale=self.scale,
+                        pre_tokens=self.sliding_window,
+                        next_tokens=0,
+                        sparse_mode=4,
+                    )
+                else:
+                    attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
+                        query=query,
+                        key=key,
+                        value=value,
+                        atten_mask=attn_metadata.attn_mask,
+                        block_table=block_table,
+                        input_layout="TND",
+                        block_size=block_size,
+                        actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        num_key_value_heads=self.num_kv_heads,
+                        num_heads=self.num_heads,
+                        head_size=self.head_size,
+                        scale=self.scale,
+                        key_cache=self.key_cache,
+                        value_cache=self.value_cache,
+                        current_key=key,
+                        current_value=passed_value,
+                        attn_metadata=attn_metadata,
+                        is_prefill_no_cache=attn_metadata.attn_state == AscendAttentionState.PrefillNoCache,
+                        sparse_mode=3,
+                    )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
         output[:num_tokens] = attn_output[:num_tokens]
