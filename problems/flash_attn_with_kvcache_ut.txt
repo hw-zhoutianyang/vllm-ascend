@@ -1,0 +1,17 @@
+pytest test_fa3_graph_incompat.py -v
+INFO 07-22 16:15:58 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 07-22 16:15:58 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 07-22 16:15:58 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 07-22 16:15:58 [__init__.py:238] Platform plugin ascend is activated
+INFO 07-22 16:15:58 [platform.py:61] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+ImportError while loading conftest '/home/code/vllm_ascend/ascend/zty/vllm-ascend/tests/ut/conftest.py'.
+../conftest.py:118: in <module>
+    adapt_patch()
+../../../vllm_ascend/utils.py:541: in adapt_patch
+    from vllm_ascend.patch import worker  # noqa: F401
+../../../vllm_ascend/patch/worker/__init__.py:24: in <module>
+    import vllm_ascend.patch.worker.patch_v2.patch_triton  # noqa
+../../../vllm_ascend/patch/worker/patch_v2/patch_triton.py:4: in <module>
+    from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
+E   ModuleNotFoundError: No module named 'vllm.v1.worker.gpu.spec_decode.dflash'
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
