@@ -1,17 +1,193 @@
-pytest test_fa3_graph_incompat.py -v
-INFO 07-22 16:15:58 [__init__.py:44] Available plugins for group vllm.platform_plugins:
-INFO 07-22 16:15:58 [__init__.py:46] - ascend -> vllm_ascend:register
-INFO 07-22 16:15:58 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
-INFO 07-22 16:15:58 [__init__.py:238] Platform plugin ascend is activated
-INFO 07-22 16:15:58 [platform.py:61] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
-ImportError while loading conftest '/home/code/vllm_ascend/ascend/zty/vllm-ascend/tests/ut/conftest.py'.
-../conftest.py:118: in <module>
-    adapt_patch()
-../../../vllm_ascend/utils.py:541: in adapt_patch
-    from vllm_ascend.patch import worker  # noqa: F401
-../../../vllm_ascend/patch/worker/__init__.py:24: in <module>
-    import vllm_ascend.patch.worker.patch_v2.patch_triton  # noqa
-../../../vllm_ascend/patch/worker/patch_v2/patch_triton.py:4: in <module>
-    from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
-E   ModuleNotFoundError: No module named 'vllm.v1.worker.gpu.spec_decode.dflash'
-sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
+pytest tests/standalone/fa3/test_fa3_graph_incompat.py -v -s
+=================================================================== test session starts ===================================================================
+platform linux -- Python 3.11.10, pytest-8.3.2, pluggy-1.6.0 -- /usr/local/python3.11.10/bin/python3.11
+cachedir: .pytest_cache
+rootdir: /home/code/vllm_ascend/ascend/zty/vllm-ascend
+configfile: pyproject.toml
+plugins: xdist-3.6.1, anyio-4.14.1
+collected 2 items                                                                                                                                         
+
+tests/standalone/fa3/test_fa3_graph_incompat.py::TestFA3NPUGraphIncompatibility::test_fa3_eager_produces_valid_output PASSED
+tests/standalone/fa3/test_fa3_graph_incompat.py::TestFA3NPUGraphIncompatibility::test_fa3_npugraph_replay_returns_stale_output [W724 11:08:16.086430194 ToKernelNpu.cpp:41] Warning: Device do not support double dtype now, dtype cast replace with float. (function operator())
+FAILED
+
+======================================================================== FAILURES =========================================================================
+______________________________________ TestFA3NPUGraphIncompatibility.test_fa3_npugraph_replay_returns_stale_output _______________________________________
+
+self = <test_fa3_graph_incompat.TestFA3NPUGraphIncompatibility object at 0xfffd7ea8c990>
+
+    def test_fa3_npugraph_replay_returns_stale_output(self):
+        """NPUGraph replay of FA3 returns stale (capture-time) output.
+    
+        When FA3 is captured inside ``torch.npu.graph()``, the driver-level
+        snapshot records kernel dispatches with the **original** tensor data
+        pointers.  Replaying the graph re-dispatches those same kernels with
+        the same addresses, so the output does NOT reflect input changes made
+        during replay.
+        """
+        # --- capture with inputs A ---
+        tensors_a = _make_tensors()
+        q_a, k_a, v_a, bt_a, kv_a, cu_q_a, max_qlen_a, _, _, metadata_a = tensors_a
+        out_a = torch.empty_like(q_a)
+    
+        # Allocate output lazily via the FA3 call, then copy to out_a so we
+        # have a stable reference.
+        ref_a = _run_fa3_eager(q_a, k_a, v_a, bt_a, kv_a, cu_q_a, max_qlen_a,
+                               scheduler_metadata=metadata_a)
+        out_a.copy_(ref_a)
+    
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+>           captured = _run_fa3_eager(q_a, k_a, v_a, bt_a, kv_a, cu_q_a,
+                                      max_qlen_a, scheduler_metadata=metadata_a)
+
+tests/standalone/fa3/test_fa3_graph_incompat.py:171: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests/standalone/fa3/test_fa3_graph_incompat.py:110: in _run_fa3_eager
+    return _fa3_kvcache(
+/usr/local/python3.11.10/lib/python3.11/site-packages/flash_attn_npu_v3/interface_arch22.py:1060: in flash_attn_with_kvcache
+    out, softmax_lse, *rest = _flash_attn_forward(
+/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_library/custom_ops.py:698: in __call__
+    return self._opoverload(*args, **kwargs)
+/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_ops.py:819: in __call__
+    return self._op(*args, **kwargs)
+/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_library/autograd.py:112: in autograd_impl
+    result = forward_no_grad(*args, Metadata(keyset, keyword_only_args))
+/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_library/autograd.py:41: in forward_no_grad
+    result = op.redispatch(keyset & _C._after_autograd_keyset, *args, **kwargs)
+/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_ops.py:826: in redispatch
+    return self._handle.redispatch_boxed(keyset, *args, **kwargs)  # type: ignore[return-value]
+/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_library/custom_ops.py:347: in backend_impl
+    result = self._backend_fns[device_type](*args, **kwargs)
+/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_compile.py:54: in inner
+    return disable_fn(*args, **kwargs)
+/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py:1181: in _fn
+    return fn(*args, **kwargs)
+/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_library/custom_ops.py:382: in wrapped_fn
+    return fn(*args, **kwargs)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+q = tensor([[[-0.8242,  0.5547,  0.8633,  ...,  0.8789,  1.4609,  2.2969],
+         [-0.3867,  0.9570, -0.6289,  ..., -1.5...,
+         [-0.6875,  0.4062,  0.0113,  ..., -0.4707, -1.7891, -1.0547]]],
+       device='npu:0', dtype=torch.bfloat16)
+k = tensor([[[[ 7.1094e-01,  3.0664e-01,  1.1328e-01,  ...,  3.3594e-01,
+           -1.1172e+00, -4.0234e-01],
+          [...312e-01, -3.5938e-01,  ..., -1.1641e+00,
+           -4.6631e-02,  7.8125e-01]]]], device='npu:0', dtype=torch.bfloat16)
+v = tensor([[[[-1.6875,  1.1250, -1.1719,  ..., -0.8203, -0.7656, -0.8242],
+          [-0.2344,  1.9062, -0.1494,  ...,  0...          [ 0.7930,  0.2676, -0.4648,  ..., -0.0381,  0.2295,  0.3125]]]],
+       device='npu:0', dtype=torch.bfloat16)
+k_new = None, v_new = None, qv = None, out_ = None, cu_seqlens_q = tensor([  0, 159, 342], device='npu:0', dtype=torch.int32), cu_seqlens_k = None
+cu_seqlens_k_new = None, seqused_q = None, seqused_k = tensor([191, 215], device='npu:0', dtype=torch.int32), max_seqlen_q = 183, max_seqlen_k = None
+page_table = tensor([[0, 1],
+        [2, 3]], device='npu:0', dtype=torch.int32), kv_batch_idx = None, leftpad_k = None, rotary_cos = None
+rotary_sin = None, seqlens_rotary = None, q_descale = None, k_descale = None, v_descale = None, softmax_scale = 0.08838834764831843, causal = True
+window_size_left = -1, window_size_right = -1, attention_chunk = 0, softcap = 0.0, rotary_interleaved = True
+scheduler_metadata = tensor([0, 1, 1,  ..., 0, 0, 0], device='npu:0', dtype=torch.uint8), num_splits = 0, pack_gqa = None, sm_margin = 0
+
+    @_torch_custom_op_wrapper("flash_attn_npu_arch22_v3::_flash_attn_forward", mutates_args=(), device_types="npu")
+    def _flash_attn_forward(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_new: Optional[torch.Tensor] = None,
+        v_new: Optional[torch.Tensor] = None,
+        qv: Optional[torch.Tensor] = None,
+        out_: Optional[torch.Tensor] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_k: Optional[torch.Tensor] = None,
+        cu_seqlens_k_new: Optional[torch.Tensor] = None,
+        seqused_q: Optional[torch.Tensor] = None,
+        seqused_k: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
+        page_table: Optional[torch.Tensor] = None,
+        kv_batch_idx: Optional[torch.Tensor] = None,
+        leftpad_k: Optional[torch.Tensor] = None,
+        rotary_cos: Optional[torch.Tensor] = None,
+        rotary_sin: Optional[torch.Tensor] = None,
+        seqlens_rotary: Optional[torch.Tensor] = None,
+        q_descale: Optional[torch.Tensor] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        window_size_left: int = -1,
+        window_size_right: int = -1,
+        attention_chunk: int = 0,
+        softcap: float = 0.0,
+        rotary_interleaved: bool = True,
+        scheduler_metadata: Optional[torch.Tensor] = None,
+        num_splits: int = 1,
+        pack_gqa: Optional[bool] = None,
+        sm_margin: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
+        v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+        cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
+            maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new)
+        ]
+        seqused_q, seqused_k = [maybe_contiguous(x) for x in (seqused_q, seqused_k)]
+        page_table, kv_batch_idx, leftpad_k = [
+            maybe_contiguous(x) for x in (page_table, kv_batch_idx, leftpad_k)
+        ]
+        rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
+        seqlens_rotary = maybe_contiguous(seqlens_rotary)
+>       out, softmax_lse, out_accum, softmax_lse_accum = flash_attn_npu_arch22_v3.fwd(
+            q,
+            k,
+            v,
+            k_new,
+            v_new,
+            qv,
+            out_,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cu_seqlens_k_new,
+            seqused_q,
+            seqused_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            page_table,
+            kv_batch_idx,
+            leftpad_k,
+            rotary_cos,
+            rotary_sin,
+            seqlens_rotary,
+            q_descale,
+            k_descale,
+            v_descale,
+            softmax_scale,
+            causal,
+            window_size_left,
+            window_size_right,
+            attention_chunk,
+            softcap,
+            rotary_interleaved,
+            scheduler_metadata,
+            num_splits,
+            pack_gqa,
+            sm_margin,
+        )
+E       RuntimeError: npuSynchronizeDevice:../torch_npu/csrc/core/npu/NPUStream.cpp:576 NPU function error: AclrtSynchronizeDeviceWithTimeout, error code is 107027
+E       [ERROR] 2026-07-24-11:08:16 (PID:663, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
+E       EE9999: Inner Error!
+E       EE9999[PID: 663] 2026-07-24-11:08:16.739.942 (EE9999):  rtDeviceSynchronizeWithTimeout execution failed, reason=stream is captured[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:65]
+E               TraceBack (most recent call last):
+E              wait for compute device to finish failed, runtime result = 107027.[FUNC:ReportCallError][FILE:log_inner.cpp][LINE:148]
+
+/usr/local/python3.11.10/lib/python3.11/site-packages/flash_attn_npu_v3/interface_arch22.py:111: RuntimeError
+==================================================================== warnings summary =====================================================================
+../../../../../../../usr/local/python3.11.10/lib/python3.11/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.11.10/lib/python3.11/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/standalone/fa3/test_fa3_graph_incompat.py::TestFA3NPUGraphIncompatibility::test_fa3_eager_produces_valid_output
+  /home/code/vllm_ascend/ascend/zty/vllm-ascend/tests/standalone/fa3/test_fa3_graph_incompat.py:71: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
+    v_cache = torch.randn_like(k_cache).npu()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================================================================= short test summary info =================================================================
+FAILED tests/standalone/fa3/test_fa3_graph_incompat.py::TestFA3NPUGraphIncompatibility::test_fa3_npugraph_replay_returns_stale_output - RuntimeError: npuSynchronizeDevice:../torch_npu/csrc/core/npu/NPUStream.cpp:576 NPU function error: AclrtSynchronizeDeviceWithTimeout, error code is 1...
+======================================================== 1 failed, 1 passed, 15 warnings in 9.60s =========================================================
