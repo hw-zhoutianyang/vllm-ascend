@@ -32,7 +32,10 @@ import torch_npu
 _HAS_FA3 = False
 if importlib_util.find_spec("flash_attn_npu_v3") is not None:
     try:
-        from flash_attn_npu_v3 import flash_attn_with_kvcache as _fa3_kvcache
+        from flash_attn_npu_v3 import (
+            flash_attn_with_kvcache as _fa3_kvcache,
+            get_scheduler_metadata,
+        )
         _HAS_FA3 = True
     except (ImportError, AttributeError):
         pass
@@ -49,8 +52,8 @@ _SEQLEN = 256
 _SCALE = 1.0 / (_HEAD_SIZE ** 0.5)
 
 
-def _make_tensors(batch: int = _BATCH):
-    """Build Q, paged K/V, block_table and cumulative seq lengths (TND)."""
+def _make_tensors(batch: int = _BATCH, causal: bool = True):
+    """Build Q, paged K/V, block_table, cumulative seq lengths (TND) and metadata."""
     q_lens = sorted(
         torch.randint(low=_SEQLEN // 2, high=_SEQLEN + 1,
                       size=(batch,)).tolist(),
@@ -76,6 +79,21 @@ def _make_tensors(batch: int = _BATCH):
     kv_seqlens = torch.tensor(kv_lens, dtype=torch.int32, device="npu")
     cu_seqlens_q = torch.tensor([0] + cu_q, dtype=torch.int32, device="npu")
     max_seqlen_q = max(q_lens)
+    max_seqlen_k = max(kv_lens)
+
+    scheduler_metadata = get_scheduler_metadata(
+        batch_size=batch,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        num_heads_q=_NUM_HEADS,
+        num_heads_kv=_NUM_KV_HEADS,
+        headdim=_HEAD_SIZE,
+        cache_seqlens=kv_seqlens,
+        qkv_dtype=_DTYPE,
+        cu_seqlens_q=cu_seqlens_q,
+        page_size=_BLOCK_SIZE,
+        causal=causal,
+    )
 
     # CANN V1 expects:
     #   actual_seq_lengths  — cumulative WITHOUT leading 0
@@ -84,10 +102,11 @@ def _make_tensors(batch: int = _BATCH):
     kv_list = kv_lens
 
     return q, k_cache, v_cache, bt, kv_seqlens, cu_seqlens_q, max_seqlen_q, \
-        cu_v1, kv_list
+        cu_v1, kv_list, scheduler_metadata
 
 
-def _run_fa3_eager(q, k, v, bt, kv_seqlens, cu_q, max_qlen, causal=True):
+def _run_fa3_eager(q, k, v, bt, kv_seqlens, cu_q, max_qlen, causal=True,
+                   scheduler_metadata=None):
     return _fa3_kvcache(
         q, k, v,
         cache_seqlens=kv_seqlens,
@@ -96,6 +115,7 @@ def _run_fa3_eager(q, k, v, bt, kv_seqlens, cu_q, max_qlen, causal=True):
         max_seqlen_q=max_qlen,
         softmax_scale=_SCALE,
         causal=causal,
+        scheduler_metadata=scheduler_metadata,
     )
 
 
@@ -120,8 +140,9 @@ class TestFA3NPUGraphIncompatibility:
 
     def test_fa3_eager_produces_valid_output(self):
         """Sanity: FA3 works correctly outside any graph context."""
-        q, k, v, bt, kv_seqlens, cu_q, max_qlen, _, _ = _make_tensors()
-        out = _run_fa3_eager(q, k, v, bt, kv_seqlens, cu_q, max_qlen)
+        q, k, v, bt, kv_seqlens, cu_q, max_qlen, _, _, metadata = _make_tensors()
+        out = _run_fa3_eager(q, k, v, bt, kv_seqlens, cu_q, max_qlen,
+                             scheduler_metadata=metadata)
         assert out.shape == (q.shape[0], _NUM_HEADS, _HEAD_SIZE)
         assert not torch.isnan(out).any()
 
@@ -136,24 +157,26 @@ class TestFA3NPUGraphIncompatibility:
         """
         # --- capture with inputs A ---
         tensors_a = _make_tensors()
-        q_a, k_a, v_a, bt_a, kv_a, cu_q_a, max_qlen_a, _, _ = tensors_a
+        q_a, k_a, v_a, bt_a, kv_a, cu_q_a, max_qlen_a, _, _, metadata_a = tensors_a
         out_a = torch.empty_like(q_a)
 
         # Allocate output lazily via the FA3 call, then copy to out_a so we
         # have a stable reference.
-        ref_a = _run_fa3_eager(q_a, k_a, v_a, bt_a, kv_a, cu_q_a, max_qlen_a)
+        ref_a = _run_fa3_eager(q_a, k_a, v_a, bt_a, kv_a, cu_q_a, max_qlen_a,
+                               scheduler_metadata=metadata_a)
         out_a.copy_(ref_a)
 
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             captured = _run_fa3_eager(q_a, k_a, v_a, bt_a, kv_a, cu_q_a,
-                                      max_qlen_a)
+                                      max_qlen_a, scheduler_metadata=metadata_a)
 
         # --- overwrite inputs with data B (in-place, same pointers) ---
         tensors_b = _make_tensors()
-        q_b, k_b, v_b, bt_b, kv_b, cu_q_b, max_qlen_b, _, _ = tensors_b
+        q_b, k_b, v_b, bt_b, kv_b, cu_q_b, max_qlen_b, _, _, metadata_b = tensors_b
         # Compute reference B
-        ref_b = _run_fa3_eager(q_b, k_b, v_b, bt_b, kv_b, cu_q_b, max_qlen_b)
+        ref_b = _run_fa3_eager(q_b, k_b, v_b, bt_b, kv_b, cu_q_b, max_qlen_b,
+                               scheduler_metadata=metadata_b)
         # Overwrite the original tensors
         q_a.copy_(q_b)
         k_a.copy_(k_b)
@@ -205,22 +228,22 @@ class TestFA3GraphTaskGroupIncompatibility:
         neighbouring CANN op was captured, replay of THAT op would corrupt
         the FA3 output.
         """
-        q, k, v, bt, kv_seqlens, cu_q, max_qlen, _, _ = _make_tensors()
+        q, k, v, bt, kv_seqlens, cu_q, max_qlen, _, _, metadata = _make_tensors(causal=causal)
         ref = _run_fa3_eager(q, k, v, bt, kv_seqlens, cu_q, max_qlen,
-                             causal=causal)
+                             causal=causal, scheduler_metadata=metadata)
         stream = torch_npu.npu.current_stream()
 
         # -- capture: FA3 is NOT recorded --
         torch.npu.graph_task_group_begin(stream)
         output = _run_fa3_eager(q, k, v, bt, kv_seqlens, cu_q, max_qlen,
-                                causal=causal)
+                                causal=causal, scheduler_metadata=metadata)
         handle = torch.npu.graph_task_group_end(stream)
 
         # -- replay with DIFFERENT input data --
-        tensors2 = _make_tensors()
-        q2, k2, v2, bt2, kv2, cu_q2, max_qlen2, _, _ = tensors2
+        tensors2 = _make_tensors(causal=causal)
+        q2, k2, v2, bt2, kv2, cu_q2, max_qlen2, _, _, metadata2 = tensors2
         ref2 = _run_fa3_eager(q2, k2, v2, bt2, kv2, cu_q2, max_qlen2,
-                              causal=causal)
+                              causal=causal, scheduler_metadata=metadata2)
 
         # During ``graph_task_update_begin/End``, the captured op (none, for
         # FA3) would be replayed.  Since nothing was captured, the FA3 call
@@ -230,7 +253,7 @@ class TestFA3GraphTaskGroupIncompatibility:
         # the mechanism is broken — the correct output is ref2.
         torch.npu.graph_task_update_begin(stream, handle)
         replay_out = _run_fa3_eager(q2, k2, v2, bt2, kv2, cu_q2, max_qlen2,
-                                    causal=causal)
+                                    causal=causal, scheduler_metadata=metadata2)
         torch.npu.graph_task_update_end(stream)
         torch.npu.synchronize()
 
@@ -264,7 +287,7 @@ class TestFA3GraphTaskGroupIncompatibility:
         replay produces correct results with updated input data.
         """
         tensors = _make_tensors()
-        q, k, v, bt, kv_seqlens, cu_q, max_qlen, cu_v1, kv_list = tensors
+        q, k, v, bt, kv_seqlens, cu_q, max_qlen, cu_v1, kv_list, _ = tensors
         k_v1, v_v1 = _build_cann_v1_tensors(k, v)
 
         stream = torch_npu.npu.current_stream()
@@ -299,7 +322,7 @@ class TestFA3GraphTaskGroupIncompatibility:
 
         # Build reference for a DIFFERENT set of inputs
         tensors2 = _make_tensors()
-        q2, k2, v2, bt2, _, _, _, cu_v1_2, kv_list_2 = tensors2
+        q2, k2, v2, bt2, _, _, _, cu_v1_2, kv_list_2, _ = tensors2
         k2_v1, v2_v1 = _build_cann_v1_tensors(k2, v2)
 
         ref_out = torch.empty(q2.shape[0], _NUM_HEADS, _HEAD_SIZE,
