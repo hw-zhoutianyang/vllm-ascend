@@ -1,18 +1,21 @@
 """
-UT: flash-attention-npu (FA3) ACL graph capture incompatibility.
+UT: flash-attention-npu (FA3) ACL graph capture behaviour.
 
-Verifies that ``flash_attn_with_kvcache`` (a PyTorch CustomOp) is **not**
-compatible with the two ACL graph mechanisms used in vllm-ascend:
+Verifies that ``flash_attn_with_kvcache`` (a PyTorch CustomOp) behaves as
+follows under the two ACL graph mechanisms used in vllm-ascend:
 
 1. ``torch.npu.NPUGraph`` (driver-level graph replay)
-   → After capture, replay with updated inputs returns stale output because
-     the captured kernel dispatches write to the **original** tensor addresses
-     and cannot be remapped.
+   → **IS compatible.**  NPUGraph records **addresses**, not values.  When
+     input tensors are overwritten in-place (``.copy_()``) before replay,
+     the kernel reads the new data from the same addresses and computes
+     the correct result.
 
 2. ``torch.npu.graph_task_group_begin/End`` (op-level in-flight remapping)
-   → This mechanism only recognises CANN-native ops registered through the
-     standard op registration path.  FA3's PyTorch CustomOp dispatch is
-     invisible to it, causing errors during replay.
+   → **Runs eagerly.**  This mechanism only recognises CANN-native ops
+     registered through the standard op registration path.  FA3's PyTorch
+     CustomOp dispatch is invisible to it, so the capture session records
+     nothing and the call inside ``graph_task_update_begin/End`` executes
+     eagerly with the new inputs, producing the correct result.
 
 Positive controls using ``npu_fused_infer_attention_score.out`` confirm
 that both mechanisms work correctly for CANN-native ops.
@@ -53,10 +56,20 @@ _SCALE = 1.0 / (_HEAD_SIZE ** 0.5)
 
 
 def _make_tensors(batch: int = _BATCH, causal: bool = True):
-    """Build Q, paged K/V, block_table, cumulative seq lengths (TND) and metadata."""
+    """Build Q, paged K/V, block_table, cumulative seq lengths (TND) and metadata.
+
+    .. important::
+       ``q_lens`` is drawn from a **local** ``torch.Generator`` seeded to a
+       fixed value so that **shape is deterministic across calls** — every
+       invocation produces the same tensor sizes, enabling ``.copy_()`` between
+       them.  The underlying random data (``torch.randn``) is still different
+       each call because it uses the **global** RNG.
+    """
+    _rng = torch.Generator()
+    _rng.manual_seed(42)
     q_lens = sorted(
         torch.randint(low=_SEQLEN // 2, high=_SEQLEN + 1,
-                      size=(batch,)).tolist(),
+                      size=(batch,), generator=_rng).tolist(),
         reverse=False,
     )
     kv_lens = [ql + 32 for ql in q_lens]
@@ -147,37 +160,42 @@ class TestFA3NPUGraphIncompatibility:
         assert not torch.isnan(out).any()
 
     def test_fa3_npugraph_replay_returns_stale_output(self):
-        """NPUGraph replay of FA3 returns stale (capture-time) output.
+        """NPUGraph replay of FA3 produces correct (non-stale) output.
 
         When FA3 is captured inside ``torch.npu.graph()``, the driver-level
-        snapshot records kernel dispatches with the **original** tensor data
-        pointers.  Replaying the graph re-dispatches those same kernels with
-        the same addresses, so the output does NOT reflect input changes made
-        during replay.
+        snapshot records kernel launch **addresses** — both input- and output-
+        tensor device pointers.  During replay those same addresses are
+        re-dispatched.  Since the input tensors are overwritten **in-place**
+        (``.copy_()`` — same address, new data), the kernel reads the new
+        data and computes the correct result, writing it to the captured
+        output address.
+
+        In other words: NPUGraph fixes **addresses**, not **values**.  As
+        long as inputs and output addresses remain valid, the kernel computes
+        correctly from whatever data lives at those addresses at replay time.
+
+        .. note::
+           This test was originally written assuming FA3 would **not** be
+           replayable (stale output).  Empirical results show it **is**
+           replayable with pre-computed ``scheduler_metadata``, so the test
+           now asserts correct replay.
         """
         # --- capture with inputs A ---
         tensors_a = _make_tensors()
         q_a, k_a, v_a, bt_a, kv_a, cu_q_a, max_qlen_a, _, _, metadata_a = tensors_a
-        out_a = torch.empty_like(q_a)
-
-        # Allocate output lazily via the FA3 call, then copy to out_a so we
-        # have a stable reference.
-        ref_a = _run_fa3_eager(q_a, k_a, v_a, bt_a, kv_a, cu_q_a, max_qlen_a,
-                               scheduler_metadata=metadata_a)
-        out_a.copy_(ref_a)
 
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             captured = _run_fa3_eager(q_a, k_a, v_a, bt_a, kv_a, cu_q_a,
                                       max_qlen_a, scheduler_metadata=metadata_a)
 
-        # --- overwrite inputs with data B (in-place, same pointers) ---
+        # --- reference for inputs B ---
         tensors_b = _make_tensors()
         q_b, k_b, v_b, bt_b, kv_b, cu_q_b, max_qlen_b, _, _, metadata_b = tensors_b
-        # Compute reference B
         ref_b = _run_fa3_eager(q_b, k_b, v_b, bt_b, kv_b, cu_q_b, max_qlen_b,
                                scheduler_metadata=metadata_b)
-        # Overwrite the original tensors
+
+        # --- overwrite inputs with data B (same pointers, new content) ---
         q_a.copy_(q_b)
         k_a.copy_(k_b)
         v_a.copy_(v_b)
@@ -189,25 +207,10 @@ class TestFA3NPUGraphIncompatibility:
         graph.replay()
         torch.npu.synchronize()
 
-        # NPUGraph replay writes to the *original* output address from capture
-        # time (``captured``).  Since the driver replay doesn't know about our
-        # in-place overwrites, the output remains equal to ref_a (stale), NOT
-        # ref_b (freshly computed from the new inputs).
-        #
-        # NOTE: This test documents the incompatibility mechanically.  The
-        # precise failing semantics depend on the CANN version; on some
-        # versions ``graph.replay()`` may also clobber unrelated memory.
-        # What matters is that replay DOES NOT equal the reference for the
-        # new input values.
-        try:
-            torch.testing.assert_close(captured, ref_b, rtol=1e-2, atol=1e-2)
-            pytest.fail(
-                "FA3 NPUGraph replay produced output matching the updated "
-                "inputs — this means FA3 WAS replayable, contradicting the "
-                "expected incompatibility."
-            )
-        except AssertionError:
-            pass  # Expected: stale output ≠ reference for new inputs
+        # NPUGraph re-dispatches captured kernels with the original addresses.
+        # Inputs now hold data B; the kernel reads data B and writes the
+        # correct result to the captured output address (``captured``).
+        torch.testing.assert_close(captured, ref_b, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.skipif(not _HAS_FA3, reason="flash-attention-npu not installed")
@@ -219,24 +222,24 @@ class TestFA3GraphTaskGroupIncompatibility:
     # ------------------------------------------------------------------
     @pytest.mark.parametrize("causal", [True, False])
     def test_fa3_graph_task_group_yields_stale_replay(self, causal):
-        """FA3 inside ``graph_task_group_begin/End`` → replay stale.
+        """FA3 inside ``graph_task_group_begin/End`` → runs eagerly, correct.
 
         vllm-ascend's op-level capture only recognises CANN-native ops.
         FA3 (PyTorch CustomOp) is invisible to it, so the capture session
-        records nothing.  On replay the FA3 call runs eagerly but the
-        *captured* (empty) session does nothing useful — and if any
-        neighbouring CANN op was captured, replay of THAT op would corrupt
-        the FA3 output.
+        records nothing.  During ``graph_task_update_begin/End``, the FA3
+        call therefore runs **eagerly** with whatever inputs are passed at
+        that point — producing the correct output for the new data.
+
+        (The ``graph_task_group`` handle is semantically a no-op here; it
+        does not interfere with the CustomOp dispatch.)
         """
         q, k, v, bt, kv_seqlens, cu_q, max_qlen, _, _, metadata = _make_tensors(causal=causal)
-        ref = _run_fa3_eager(q, k, v, bt, kv_seqlens, cu_q, max_qlen,
-                             causal=causal, scheduler_metadata=metadata)
         stream = torch_npu.npu.current_stream()
 
-        # -- capture: FA3 is NOT recorded --
+        # -- capture: FA3 is NOT recorded by CANN op-level capture --
         torch.npu.graph_task_group_begin(stream)
-        output = _run_fa3_eager(q, k, v, bt, kv_seqlens, cu_q, max_qlen,
-                                causal=causal, scheduler_metadata=metadata)
+        _run_fa3_eager(q, k, v, bt, kv_seqlens, cu_q, max_qlen,
+                       causal=causal, scheduler_metadata=metadata)
         handle = torch.npu.graph_task_group_end(stream)
 
         # -- replay with DIFFERENT input data --
@@ -245,36 +248,15 @@ class TestFA3GraphTaskGroupIncompatibility:
         ref2 = _run_fa3_eager(q2, k2, v2, bt2, kv2, cu_q2, max_qlen2,
                               causal=causal, scheduler_metadata=metadata2)
 
-        # During ``graph_task_update_begin/End``, the captured op (none, for
-        # FA3) would be replayed.  Since nothing was captured, the FA3 call
-        # inside runs eager, which SHOULD give ref2.  However, if the
-        # *capture-time* output tensor address was recorded in the handle,
-        # the replay machinery may overwrite it with stale data.  Either way
-        # the mechanism is broken — the correct output is ref2.
+        # FA3 was not captured — the call inside the update block runs
+        # eagerly with the new inputs, producing the correct result.
         torch.npu.graph_task_update_begin(stream, handle)
         replay_out = _run_fa3_eager(q2, k2, v2, bt2, kv2, cu_q2, max_qlen2,
                                     causal=causal, scheduler_metadata=metadata2)
         torch.npu.graph_task_update_end(stream)
         torch.npu.synchronize()
 
-        try:
-            torch.testing.assert_close(replay_out, ref2, rtol=1e-2, atol=1e-2)
-        except AssertionError:
-            # FA3 was not properly captured → replay differs from reference.
-            return  # Expected failure — test passes.
-
-        # If we reach here, replay matches reference.  This means either:
-        # (a) FA3 was captured and correctly replayed (unlikely — contradicts
-        #     known architecture), or
-        # (b) the graph_task_group handle was empty and FA3 ran eagerly on
-        #     the new inputs.
-        # Both are "safe" but (a) would be a surprise worth flagging.
-        # We still pass — the test's goal is to document the behaviour, not
-        # to enforce failure.
-        pytest.skip(
-            "FA3 output matched reference on replay — FA3 may have run "
-            "eagerly (no capture interference).  This is not a failure."
-        )
+        torch.testing.assert_close(replay_out, ref2, rtol=1e-2, atol=1e-2)
 
     # ------------------------------------------------------------------
     # Positive control: CANN V1 inside graph_task_group works correctly
