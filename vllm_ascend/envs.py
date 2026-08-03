@@ -110,6 +110,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Debug-only: log the device-side forward time of every model forward in
+    # the worker. Synchronizes the NPU per step, breaking the async scheduling
+    # overlap; enable only when correlating per-step forward time with the
+    # engine-side [decode_step] e2e logs.
+    "VLLM_ASCEND_LOG_FORWARD_TIME": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_LOG_FORWARD_TIME", "0"))
+    ),
 }
 
 # end-env-vars-definition

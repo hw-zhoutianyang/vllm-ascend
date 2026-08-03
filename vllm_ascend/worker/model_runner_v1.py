@@ -102,6 +102,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -2264,9 +2265,28 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+            if envs.VLLM_ASCEND_LOG_FORWARD_TIME:
+                # Debug-only: synchronize to get a true device-side forward
+                # time. This breaks the async scheduling overlap, so only
+                # enable it when correlating per-step forward time with the
+                # engine-side [decode_step] logs.
+                torch.npu.synchronize()
+                forward_start = time.perf_counter()
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if envs.VLLM_ASCEND_LOG_FORWARD_TIME:
+                torch.npu.synchronize()
+                forward_ms = (time.perf_counter() - forward_start) * 1e3
+                logger.info(
+                    "[forward] reqs=%d tokens_unpadded=%d tokens_padded=%d "
+                    "cudagraph_mode=%s forward_ms=%.2f",
+                    num_reqs,
+                    num_tokens_unpadded,
+                    num_tokens_padded,
+                    cudagraph_mode,
+                    forward_ms,
+                )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
